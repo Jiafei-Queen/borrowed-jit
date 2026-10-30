@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CheerpJ Interpreted and JIT Baseline</title>
+<script src="https://cjrtnc.leaningtech.com/4.3/loader.js"></script>
+<style>
+  body { font-family: -apple-system, monospace; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.15em; }
+  pre { background: #f4f4f4; padding: 12px; border-radius: 6px; white-space: pre-wrap; }
+  button { font-size: 1em; padding: 8px 16px; }
+  .note { color: #666; font-size: 0.88em; }
+</style>
+</head>
+<body>
+<h1>CheerpJ Interpreted vs JIT Baseline (7 Workloads)</h1>
+<p class="note">
+Must be served statically (<code>python3 -m http.server 8765</code>) before access; the runtime is loaded only once, and a single click executes all 7 workloads sequentially.<br>
+Each workload reports two forms: interp (3 large calls) and jit (800 warm-up calls followed by 5 rounds × 400 small calls).<br>
+<code>chk=OK</code> indicates that both forms produce identical results; timing variation across jit rounds reflects host-engine JIT behaviour.<br>
+System.out is emitted to both the page and the browser console.
+</p>
+<button id="run" onclick="run()">Run benchmark</button>
+<pre id="out">Waiting to run…</pre>
+
+<script>
+const out = document.getElementById("out");
+function log(s) { out.textContent += s + "\n"; }
+
+// ---- stdout capture: CheerpJ pipes System.out to console.log; hook it so
+// output also lands in the page (matching bjvm-bench.html behavior) ----
+const nativeLog = console.log.bind(console);
+let capturing = false;
+console.log = function (...args) {
+  if (capturing) {
+    for (const a of args) {
+      if (typeof a === "string") {
+        const line = a.trimEnd();
+        if (line) log(line);
+      }
+    }
+  }
+  nativeLog(...args);
+};
+
+let inited = false;
+async function run() {
+  document.getElementById("run").disabled = true;
+  out.textContent = "";
+  if (!inited) {
+    log("Initializing CheerpJ runtime");
+    const t0 = performance.now();
+    await cheerpjInit({ status: "none" });
+    log("CheerpJ runtime ready (load time " + Math.round(performance.now() - t0) + " ms)");
+    inited = true;
+  }
+  capturing = true;
+  log("Executing bench.jar");
+  try {
+    await cheerpjRunJar("/app/bench.jar");
+  } finally {
+    capturing = false;
+  }
+  log("Benchmark complete");
+}
+</script>
+</body>
+</html>

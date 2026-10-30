@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>b-jvm Interpreted-Execution Baseline</title>
+<style>
+  body { font-family: -apple-system, monospace; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.15em; }
+  pre { background: #f4f4f4; padding: 12px; border-radius: 6px; white-space: pre-wrap; }
+  button { font-size: 1em; padding: 8px 16px; }
+  .note { color: #666; font-size: 0.88em; }
+</style>
+</head>
+<body>
+<h1>b-jvm Pure Interpreter Baseline (7 Workloads)</h1>
+<p class="note">
+Must be served statically (<code>python3 -m http.server 8765</code>) before access; the first load downloads roughly 54 MB of runtime (JDK 23 class libraries), and subsequent visits are substantially faster once the HTTP cache is warm.<br>
+The JIT path in b-jvm (dumb_jit / attempt_jit) is unconditionally disabled in the current source, so this configuration constitutes the pure-interpreter baseline.
+</p>
+<p class="note" id="status">Ready</p>
+<script type="module">
+const out = document.getElementById("out");
+function log(s) { out.textContent += s + "\n"; }
+function setstatus(s) { document.getElementById("status").textContent = s; }
+
+// ---------- minimal port of bjvm2.ts core paths ----------
+
+const ASSETS = "./bjvm-assets/";
+const RUNTIME_FILES = [
+  "jdk23/lib/modules",
+  "jdk23/lib/security/default.policy",
+  "jdk23/conf/security/java.security",
+  "jdk23/conf/security/java.policy",
+  "jdk23.jar",
+];
+
+let textOut = "";
+function onStdout(bytes) {
+  textOut += new TextDecoder().decode(bytes);
+  const idx = textOut.lastIndexOf("\n");
+  if (idx >= 0) {
+    log(textOut.slice(0, idx));
+    textOut = textOut.slice(idx + 1);
+  }
+}
+
+let heapViews = null; // set after module init, refreshed on growth
+function view(ptr, len) {
+  const m = window.__bjvmModule;
+  if (!heapViews || heapViews.buf !== m.HEAPU8.buffer) {
+    heapViews = { buf: m.HEAPU8.buffer, u8: new Uint8Array(m.HEAPU8.buffer) };
+  }
+  return { u8: heapViews.u8, ptr, len };
+}
+function writeBytes(dstPtr, srcBytes) {
+  const m = window.__bjvmModule;
+  new Uint8Array(m.HEAPU8.buffer).set(srcBytes, dstPtr);
+}
+
+class Thread {
+  constructor(vm, ptr) { this.vm = vm; this.ptr = ptr; }
+
+  createString(str) {
+    const m = this.vm.m;
+    const malloced = m._malloc(2 * str.length);
+    const arr = new Uint8Array(m.HEAPU8.buffer, malloced, str.length);
+    const res = new TextEncoder().encodeInto(str, arr);
+    const p = m._ffi_create_string(this.ptr, malloced, res.written);
+    m._free(malloced);
+    this.throwThreadException();
+    return p;
+  }
+
+  throwThreadException() {
+    const m = this.vm.m;
+    const p = m._ffi_get_current_exception(this.ptr);
+    if (!p) return;
+    m._ffi_clear_current_exception(this.ptr);
+    const h = this.vm.createHandle(p);
+    throw h;
+  }
+
+  // static, zero-arg, void-returning call; awaits scheduling like bjvm2.ts
+  async runStaticVoid(methodInfo) {
+    const m = this.vm.m;
+    const argsPtr = m._malloc(8);
+    const scheduled = this.vm.scheduleMethod(this, methodInfo, argsPtr);
+    try {
+      await scheduled.waitForResolution;
+      this.throwThreadException();
+    } finally {
+      if (scheduled.record) m._ffi_free_execution_record(scheduled.record);
+      m._free(argsPtr);
+    }
+  }
+}
+
+class VM {
+  // m: module; os: BovineOS-like {options}
+  constructor(m, options) {
+    this.m = m;
+    this.options = options;
+    const cp = options.classpath;
+    const cpPtr = m._malloc(cp.length + 1);
+    new TextEncoder().encodeInto(cp, new Uint8Array(m.HEAPU8.buffer, cpPtr, cp.length));
+    m.HEAPU8[cpPtr + cp.length] = 0;
+    this.stdoutFn = options.stdout;
+    this.stderrFn = options.stderr;
+    this.ptr = m._ffi_create_vm(cpPtr, options.heapSize ?? (1 << 26),
+      m.addFunction((p, l) => this.onStdout(p, l), 'viii'),
+      m.addFunction((p, l) => this.onStderr(p, l), 'viii'));
+    m._free(cpPtr);
+    if (!this.ptr) throw new Error("Failed to create VM");
+    this.scheduler = m._ffi_create_rr_scheduler(this.ptr);
+    this.primordial = new Thread(this, m._ffi_create_thread(this.ptr));
+    this.activeThread = this.primordial;
+    this.namedClasses = new Map();
+    this.timeout = -1;
+    this.pending = [];
+    this.waitingForYield = 0;
+  }
+  onStdout(p, l) {
+    const v = view(p, l);
+    try { this.stdoutFn?.(v.u8.slice(v.ptr, v.ptr + v.len)); } catch (e) {}
+  }
+  onStderr(p, l) {
+    const v = view(p, l);
+    try { this.stderrFn?.(v.u8.slice(v.ptr, v.ptr + v.len)); } catch (e) {}
+  }
+  scheduleTimeout(waitUs = 0) {
+    const m = this.m;
+    if (this.waitingForYield > waitUs && this.timeout !== -1) {
+      clearTimeout(this.timeout); this.timeout = -1;
+    }
+    if (this.timeout === -1) {
+      this.timeout = setTimeout(() => {
+        this.timeout = -1;
+        const status = m._ffi_rr_scheduler_step(this.scheduler);
+        if (status !== 0) {
+          const w = m._ffi_rr_scheduler_wait_for_us(this.scheduler);
+          this.scheduleTimeout(this.waitingForYield = w);
+        }
+        for (const f of this.pending.splice(0)) f();
+      }, waitUs / 1000);
+    }
+  }
+  scheduleMethod(thread, method, argsPtr) {
+    const m = this.m;
+    const record = m._ffi_rr_schedule(thread.ptr, method.methodPointer, argsPtr);
+    let cancelled = false, resolve_;
+    const waitForResolution = (async () => {
+      while (!m._ffi_rr_record_is_ready(record)) {
+        if (cancelled) return false;
+        this.scheduleTimeout();
+        await new Promise((resolve) => { resolve_ = resolve; this.pending.push(resolve); });
+      }
+      return true;
+    })();
+    return {
+      record,
+      waitForResolution,
+      cancelResolution: () => {
+        cancelled = true;
+        const i = this.pending.indexOf(resolve_);
+        if (i >= 0) this.pending.splice(i, 1);
+      }
+    };
+  }
+  setActiveThread(t) { this.activeThread = t ?? this.primordial; }
+  getActiveThread() { return this.activeThread; }
+  createHandle(p) {
+    if (!p) return null;
+    const m = this.m;
+    if (m._ffi_is_string(p)) {
+      const chars = m._ffi_get_string_data(p);
+      const len = m._ffi_get_string_len(p);
+      const coder = m._ffi_get_string_coder(p);
+      const bytes = new Uint8Array(m.HEAPU8.buffer, chars, len);
+      return coder === 0 ? new TextDecoder('latin1').decode(bytes)
+                         : new TextDecoder('utf-16').decode(bytes);
+    }
+    const idx = m._make_js_handle(this.ptr, p);
+    const cd = m._ffi_get_classdesc(p);
+    const clazz = this.getClassForDescriptor(cd);
+    const h = Object.create(clazz.prototype);
+    h.vm = this; h.handleIndex = idx;
+    return h;
+  }
+  loadClass(name) {
+    const m = this.m;
+    const t = this.getActiveThread();
+    const namePtr = m._malloc(name.length + 1);
+    new TextEncoder().encodeInto(name, new Uint8Array(m.HEAPU8.buffer, namePtr, name.length));
+    m.HEAPU8[namePtr + name.length] = 0;
+    const p = m._ffi_get_class(t.ptr, namePtr);
+    if (!p) t.throwThreadException();
+    const clazz = this.getClassForDescriptor(p);
+    m._free(namePtr);
+    return clazz;
+  }
+  getClassForDescriptor(cd) {
+    if (this.namedClasses.has(cd)) return this.namedClasses.get(cd);
+    const m = this.m;
+    const jsonPtr = m._ffi_get_class_json(cd);
+    const info = JSON.parse(m.UTF8ToString(jsonPtr));
+    m._free(jsonPtr);
+    const clazz = this.makeClass(info);
+    this.namedClasses.set(cd, clazz);
+    return clazz;
+  }
+  makeClass(info) {
+    const vm = this;
+    const vmGetter = () => vm;
+    class Cls {
+      constructor() { throw new Error("Use static methods or loadClass-based instantiation"); }
+      static get vm() { return vmGetter(); }
+    }
+    for (const meth of info.methods) {
+      if (!(meth.accessFlags & 0x0001)) continue;          // public only
+      if (!(meth.accessFlags & 0x0008)) continue;          // static only (bench only needs these)
+      Cls[meth.name] = async (...args) => {
+        const t = vm.getActiveThread();
+        const m = vm.m;
+        // parse descriptor for arg conversion
+        const parsed = parseDescriptor(meth.descriptor);
+        const argsPtr = m._malloc(Math.max(8, args.length * 8));
+        try {
+          for (let i = 0; i < args.length; i++) {
+            setJavaType(t, argsPtr + i * 8, parsed.parameterTypes[i], args[i]);
+          }
+          const scheduled = vm.scheduleMethod(t, meth, argsPtr);
+          try {
+            await scheduled.waitForResolution;
+            t.throwThreadException();
+            if (parsed.returnType.kind === 'V') return undefined;
+            const rp = m._ffi_get_execution_record_result_pointer(scheduled.record);
+            return readJavaType(vm, rp, parsed.returnType);
+          } finally {
+            if (scheduled.record) m._ffi_free_execution_record(scheduled.record);
+          }
+        } finally {
+          m._free(argsPtr);
+        }
+      };
+    }
+    return Cls;
+  }
+}
+
+// ---- descriptor helpers (port of bjvm2.ts) ----
+function parseParameterType(desc, i, out) {
+  let dims = 0;
+  while (desc[i] === '[') { i++; dims++; }
+  if (desc[i] === 'L') {
+    let j = ++i;
+    while (desc[i] !== ';') i++;
+    out.push({ kind: 'L', className: "[".repeat(dims) + "L" + desc.substring(j, i) });
+    return i + 1;
+  }
+  out.push(dims ? { kind: 'L', className: "[".repeat(dims) + desc[i] }
+                : { kind: desc[i], className: "" });
+  return i + 1;
+}
+function parseDescriptor(desc) {
+  let i = 1, parameterTypes = [];
+  while (desc[i] !== ')') i = parseParameterType(desc, i, parameterTypes);
+  const returnType = [];
+  if (desc[i + 1] === 'V') returnType.push({ kind: 'V', className: "" });
+  else parseParameterType(desc, i + 1, returnType);
+  return { returnType: returnType[0], parameterTypes };
+}
+function setJavaType(thread, addr, type, value) {
+  const m = thread.vm.m;
+  switch (type.kind) {
+    case 'L':
+      if (value === null) { m.setValue(addr, 0, 'i32'); return; }
+      if (typeof value === 'string') {
+        m.setValue(addr, thread.createString(value), 'i32'); return;
+      }
+      m.setValue(addr, m._deref_js_handle(thread.vm.ptr, value.handleIndex), 'i32'); return;
+    case 'I': m.setValue(addr, value, 'i32'); return;
+    case 'F': m.setValue(addr, value, 'float'); return;
+    case 'D': m.setValue(addr, value, 'double'); return;
+    case 'J': m.setValue(addr, value, 'i64'); return;
+    case 'S': m.setValue(addr, value, 'i16'); return;
+    case 'B': m.setValue(addr, value, 'i8'); return;
+    case 'C': m.setValue(addr, value.charCodeAt(0), 'i16'); return;
+    case 'Z': m.setValue(addr, value ? 1 : 0, 'i8'); return;
+    default: throw new Error("Invalid java type: " + type.kind);
+  }
+}
+function readJavaType(vm, addr, type) {
+  const m = vm.m;
+  switch (type.kind) {
+    case 'L': return vm.createHandle(m.getValue(addr, 'i32'));
+    case 'I': return m.getValue(addr, 'i32');
+    case 'F': return m.getValue(addr, 'float');
+    case 'D': return m.getValue(addr, 'double');
+    case 'J': return m.getValue(addr, 'i64');
+    case 'S': return m.getValue(addr, 'i16');
+    case 'B': return m.getValue(addr, 'i8');
+    case 'C': return String.fromCharCode(m.getValue(addr, 'i16'));
+    case 'Z': return m.getValue(addr, 'i8') !== 0;
+    default: throw new Error("Invalid java type: " + type.kind);
+  }
+}
+
+// ---------- bootstrap ----------
+
+async function fetchRuntimeFiles(onProgress) {
+  const m = window.__bjvmModule;
+  const dirs = new Set(), files = new Set();
+  for (const file of RUNTIME_FILES) {
+    const resp = await fetch(ASSETS + file);
+    if (!resp.ok) throw new Error("fetch failed: " + file + " (" + resp.status + ")");
+    const data = new Uint8Array(await resp.arrayBuffer());
+    // mkdir -p
+    for (let i = 1; i < file.length; i++) {
+      if (file[i] === '/') {
+        const dir = file.slice(0, i);
+        if (!dirs.has(dir)) { m.FS.mkdir(dir, 0o777); dirs.add(dir); }
+      }
+    }
+    m.FS.writeFile(file, data);
+    files.add(file);
+    onProgress(file, data.length);
+  }
+}
+
+async function run() {
+  document.getElementById("run").disabled = true;
+  out.textContent = "";
+  const statusP = document.getElementById("status");
+
+  log("Initializing WASM runtime");
+  const factory = (await import("./bjvm-assets/bjvm_main.js")).default;
+  const m = await factory({
+    locateFile: (path) => path.endsWith(".wasm") ? "./bjvm-assets/bjvm_main.wasm" : path,
+    print: null, printErr: null,
+  });
+  window.__bjvmModule = m;
+
+  log("Fetching JDK 23 runtime files");
+  let doneBytes = 0;
+  await fetchRuntimeFiles((file, len) => {
+    doneBytes += len;
+    statusP.textContent = `Runtime download ${(doneBytes / 1048576).toFixed(1)} MB (${file})`;
+  });
+
+  log("Creating VM (classpath=/:/app/bench.jar)");
+  // copy bench.jar into the wasm FS
+  const jarBytes = new Uint8Array(await (await fetch("./bench.jar")).arrayBuffer());
+  m.FS.mkdir("/app", 0o777);
+  m.FS.writeFile("/app/bench.jar", jarBytes);
+
+  const vm = new VM(m, {
+    classpath: "/:/app/bench.jar",
+    stdout: onStdout,
+    stderr: (b) => log("[stderr] " + new TextDecoder().decode(b)),
+  });
+
+  log("Loading Bench class");
+  const Bench = vm.loadClass("Bench");
+  log("Executing Bench.run()");
+  log("Fields: wl,form,round,ns_per_iter");
+  await Bench.run();
+  log("Benchmark complete");
+}
+window.__runBjvmBench = run;
+</script>
+<button id="run" onclick="__runBjvmBench()">Run benchmark</button>
+<pre id="out">Waiting to run…</pre>
+</body>
+</html>
